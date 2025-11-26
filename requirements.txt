@@ -1,0 +1,13 @@
+torch==2.8.0
+torchaudio
+torchvision
+git+https://github.com/huggingface/diffusers
+transformers
+huggingface_hub
+gradio
+numpy==1.26.4
+accelerate
+mmgp
+peft
+openai
+modelscope
