@@ -2,6 +2,7 @@ import io
 import os
 import gc
 import json
+import math
 from mmgp import offload, profile_type
 import torch
 import numpy as np
@@ -12,7 +13,7 @@ import random
 import argparse
 import requests
 import datetime
-from diffusers import Flux2Pipeline, Flux2Transformer2DModel, QuantoConfig
+from diffusers import Flux2Pipeline, Flux2Transformer2DModel
 from diffusers.utils import load_image
 
 
@@ -22,7 +23,7 @@ parser.add_argument("--server_port", type=int, default=7891, help="使用端口"
 parser.add_argument("--share", action="store_true", help="是否启用gradio共享")
 parser.add_argument("--mcp_server", action="store_true", help="是否启用mcp服务")
 parser.add_argument("--compile", action="store_true", help="是否启用compile加速")
-parser.add_argument("--max_vram", type=float, default=0.8, help="最大显存使用比例")
+parser.add_argument("--res_vram", type=int, default=2000, help="显存保留，单位MB。数值越大，占用显存越小，速度越慢")
 args = parser.parse_args()
 
 print(" 启动中，请耐心等待 bilibili@十字鱼 https://space.bilibili.com/893892")
@@ -46,26 +47,19 @@ else:
 
 os.makedirs("outputs", exist_ok=True)
 repo_id = "./models"
-budgets = int(torch.cuda.get_device_properties(0).total_memory/1048576 * args.max_vram)
+budgets = int(torch.cuda.get_device_properties(0).total_memory/1048576 - args.res_vram)
 stop_generation = False
 
-"""quantization_config = QuantoConfig(weights_dtype="int8")
-transformer = Flux2Transformer2DModel.from_pretrained(
+"""transformer = Flux2Transformer2DModel.from_pretrained(
     repo_id, 
     subfolder="transformer", 
-    quantization_config=quantization_config,
     torch_dtype=dtype,
-)
-for name, param in transformer.named_parameters():
-    if "input_scale" in name or "output_scale" in name:
-        if param.shape == torch.Size([1]):
-            param.data = param.data.squeeze()
-transformer.save_pretrained("models/transformer-qint8")"""
-transformer = Flux2Transformer2DModel.from_pretrained(
-    repo_id, 
-    subfolder="transformer-qint8", 
-    torch_dtype=dtype,
-    ignore_mismatched_sizes=True,
+)"""
+transformer = offload.fast_load_transformers_model(
+    f"{repo_id}/transformer/mmgp.safetensors",
+    do_quantize=False,
+    modelClass=Flux2Transformer2DModel,
+    forcedConfigPath=f"{repo_id}/transformer/config.json",
 )
 pipe = Flux2Pipeline.from_pretrained(
     repo_id, 
@@ -74,12 +68,17 @@ pipe = Flux2Pipeline.from_pretrained(
     torch_dtype=dtype,
     low_cpu_mem_usage=False, 
 )
-mmgp = offload.profile(
+mmgp = offload.all(
     {"transformer": pipe.transformer, "vae": pipe.vae}, 
-    profile_type.LowRAM_HighVRAM, 
+    pinnedMemory= "transformer",
     budgets={'*': budgets}, 
     compile=True if args.compile else False,
 )
+"""offload.save_model(
+    model=pipe.transformer, 
+    file_path=f"{repo_id}/transformer/mmgp.safetensors", 
+    config_file_path=f"{repo_id}/transformer/config.json",
+)"""
 
 # 解决冲突端口（感谢licyk酱提供的代码~）
 def find_port(port: int) -> int:
@@ -148,6 +147,24 @@ def scale_resolution_1_5(width, height):
     return new_width, new_height, "✅ 分辨率已调整为1.5倍"
 
 
+def adjust_width_height(image):
+    image_width, image_height = image.size
+    vae_width, vae_height = calculate_dimensions(1024*1024, image_width / image_height)
+    calculated_height = vae_height // 32 * 32
+    calculated_width = vae_width // 32 * 32
+    return int(calculated_width), int(calculated_height), "✅ 根据图片调整宽高"
+
+
+def calculate_dimensions(target_area, ratio):
+    width = math.sqrt(target_area * ratio)
+    height = width / ratio
+
+    width = round(width / 32) * 32
+    height = round(height / 32) * 32
+
+    return width, height
+
+
 def generate(
     prompt, 
     width, 
@@ -176,6 +193,8 @@ def generate(
         if image_imput:
             output = pipe(
                 prompt_embeds=remote_text_encoder(prompt, hf_token),
+                width=width,
+                height=height,
                 image=load_image(image_imput),
                 generator=torch.Generator(device=device).manual_seed(seed),
                 num_inference_steps=num_inference_steps,
@@ -184,6 +203,8 @@ def generate(
         else:
             output = pipe(
                 prompt_embeds=remote_text_encoder(prompt, hf_token),
+                width=width,
+                height=height,
                 generator=torch.Generator(device=device).manual_seed(seed),
                 num_inference_steps=num_inference_steps,
                 guidance_scale=4,
@@ -198,7 +219,7 @@ def generate(
             torch.cuda.ipc_collect()
     
 
-with gr.Blocks(title="flux2-diffusers") as demo:
+with gr.Blocks(title="flux2-diffusers", theme=gr.themes.Soft(font=[gr.themes.GoogleFont("IBM Plex Sans")])) as demo:
     gr.Markdown("""
             <div>
                 <h2 style="font-size: 30px;text-align: center;">flux2-diffusers</h2>
@@ -232,13 +253,13 @@ with gr.Blocks(title="flux2-diffusers") as demo:
                     generate_button = gr.Button("🎬 开始生成", variant='primary', scale=4)
                     with gr.Accordion("参数设置", open=True):
                         with gr.Row():
-                            width = gr.Slider(label="宽度", minimum=256, maximum=2656, step=16, value=1328)
-                            height = gr.Slider(label="高度", minimum=256, maximum=2656, step=16, value=1328)
+                            width = gr.Slider(label="宽度", minimum=256, maximum=2048, step=16, value=1024)
+                            height = gr.Slider(label="高度", minimum=256, maximum=2048, step=16, value=1024)
                         with gr.Row():
                             exchange_button = gr.Button("🔄 交换宽高")
                             scale_1_5_button = gr.Button("1.5倍分辨率")
                         batch_images = gr.Slider(label="批量生成", minimum=1, maximum=100, step=1, value=1)
-                        num_inference_steps = gr.Slider(label="采样步数（推荐4步）", minimum=1, maximum=100, step=1, value=4)
+                        num_inference_steps = gr.Slider(label="采样步数（推荐28步）", minimum=1, maximum=100, step=1, value=20)
                         seed_param = gr.Number(label="种子，请输入自然数，-1为随机", value=-1)
                 with gr.Column():
                     info = gr.Textbox(label="提示信息", interactive=False)
@@ -270,7 +291,11 @@ with gr.Blocks(title="flux2-diffusers") as demo:
         inputs=[width, height],
         outputs=[width, height, info]
     )
-
+    image_input.upload(
+        fn=adjust_width_height, 
+        inputs=[image_input], 
+        outputs=[width, height, info]
+    )
 
 if __name__ == "__main__": 
     demo.launch(
@@ -279,5 +304,4 @@ if __name__ == "__main__":
         share=args.share, 
         mcp_server=args.mcp_server,
         inbrowser=True,
-        theme=gr.themes.Soft(font=[gr.themes.GoogleFont("IBM Plex Sans")]),
     )
